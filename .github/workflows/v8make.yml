@@ -21,8 +21,7 @@ on:
 jobs:
   build-windows:
     runs-on: windows-latest
-    # 设置超时时间，V8 编译比较慢，防止卡死
-    timeout-minutes: 360 
+    timeout-minutes: 360
 
     steps:
     - name: Set up Python
@@ -30,37 +29,63 @@ jobs:
       with:
         python-version: '3.11'
 
+    - name: Configure Git
+      shell: powershell
+      run: |
+        # 修复 Git 配置报错的问题
+        git config --global user.name "GitHub Actions"
+        git config --global user.email "actions@github.com"
+        git config --global core.autocrlf false
+        git config --global core.filemode false
+        # 告诉 depot_tools 不要以此再次修改配置
+        git config --global depot-tools.allowGlobalGitConfig false
+
     - name: Install depot_tools
       shell: powershell
       run: |
-        # 下载并解压 depot_tools
         Invoke-WebRequest -Uri "https://storage.googleapis.com/chrome-infra/depot_tools.zip" -OutFile "depot_tools.zip"
         Expand-Archive -Path "depot_tools.zip" -DestinationPath "C:\depot_tools" -Force
-        # 将 depot_tools 添加到环境变量
         echo "C:\depot_tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-        # 设置环境变量让 depot_tools 使用系统安装的 VS，而不是自己下载
         echo "DEPOT_TOOLS_WIN_TOOLCHAIN=0" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
     - name: Update depot_tools
       shell: powershell
       run: |
-        # 第一次运行 gclient 会自动通过网络自我更新并下载 python/git 等内部工具
-        # 设置 path 后需要刷新当前 shell 才能生效，所以这里显式调用
         $env:Path = "C:\depot_tools;" + $env:Path
+        # 显式运行一次 update
         gclient --version
 
-    - name: Fetch V8 Source Code
+    - name: Fetch V8 Source Code (Step-by-Step)
       shell: powershell
       run: |
         $env:Path = "C:\depot_tools;" + $env:Path
         mkdir v8_build
         cd v8_build
-        # 初始化 gclient 配置
+        
+        # 1. 初始化 gclient
         gclient config --name=v8 "https://chromium.googlesource.com/v8/v8.git"
-        # 同步指定版本的代码
-        # --no-history 减少下载量
-        echo "Syncing V8 version ${{ inputs.v8_version }}..."
-        gclient sync --revision v8@${{ inputs.v8_version }} --no-history --shallow
+        
+        # 2. 先同步最新的 HEAD (浅克隆)，建立基础目录结构
+        #    这里不指定版本，防止找不到 ref 报错
+        echo "Step 1: Syncing HEAD..."
+        gclient sync --no-history --shallow
+        
+        cd v8
+        # 3. 显式 Fetch 指定的 Tag
+        #    使用完整的 refspec: refs/tags/xxx，确保 Git 能找到它
+        $tag = "${{ inputs.v8_version }}"
+        echo "Step 2: Fetching tag refs/tags/$tag..."
+        git fetch origin refs/tags/$tag`:refs/tags/$tag --depth=1
+        
+        # 4. 切换到该 Tag
+        echo "Step 3: Checkout $tag..."
+        git checkout $tag
+        
+        cd ..
+        # 5. 同步该版本的依赖库 (Dependencies)
+        #    -D 参数会移除未在 DEPS 文件中定义的依赖，确保环境纯净
+        echo "Step 4: Syncing dependencies..."
+        gclient sync -D
 
     - name: Generate Build Files (GN)
       shell: powershell
@@ -68,13 +93,11 @@ jobs:
       run: |
         $env:Path = "C:\depot_tools;" + $env:Path
         
-        # 根据输入构建参数
         $pointer_compression = "${{ inputs.pointer_compression }}" -eq "true" ? "true" : "false"
         $sandbox = "${{ inputs.sandbox }}" -eq "true" ? "true" : "false"
         
         echo "Building with Pointer Compression: $pointer_compression"
         
-        # 生成参数字符串
         $args = @"
         is_debug = false
         target_cpu = ""x64""
@@ -87,7 +110,6 @@ jobs:
         dcheck_always_on = false
         "@
         
-        # 写入 args.gn
         gn gen out/release --args="$args"
 
     - name: Compile d8 (Ninja)
@@ -95,19 +117,24 @@ jobs:
       working-directory: v8_build/v8
       run: |
         $env:Path = "C:\depot_tools;" + $env:Path
-        # 开始编译，目标是 d8
         ninja -C out/release d8
 
     - name: Rename and Prepare Artifact
       shell: powershell
       working-directory: v8_build/v8/out/release
       run: |
-        # 重命名以便区分
         $suffix = "${{ inputs.pointer_compression }}" -eq "true" ? "pc_on" : "pc_off"
+        # 复制 d8.exe 并重命名
         Copy-Item d8.exe -Destination "v8_${{ inputs.v8_version }}_${suffix}.exe"
+        
+        # 某些版本可能还需要这两个文件，一并打包以防万一
+        if (Test-Path icu_data.bin) { Copy-Item icu_data.bin -Destination "icu_data.bin" }
+        if (Test-Path snapshot_blob.bin) { Copy-Item snapshot_blob.bin -Destination "snapshot_blob.bin" }
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: v8-binary-${{ inputs.v8_version }}
-        path: v8_build/v8/out/release/v8_*.exe
+        name: v8-binary-${{ inputs.v8_version }}-${{ inputs.pointer_compression }}
+        path: |
+            v8_build/v8/out/release/v8_*.exe
+            v8_build/v8/out/release/*.bin
