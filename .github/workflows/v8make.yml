@@ -1,0 +1,113 @@
+name: Build V8 for View8
+
+on:
+  workflow_dispatch:
+    inputs:
+      v8_version:
+        description: 'V8 Version Tag (e.g., 10.6.194.27)'
+        required: true
+        default: '10.6.194.27'
+      pointer_compression:
+        description: 'Enable Pointer Compression (True for Electron/Node > 14)'
+        required: true
+        type: boolean
+        default: true
+      sandbox:
+        description: 'Enable V8 Sandbox (Usually True for newer Electron)'
+        required: true
+        type: boolean
+        default: true
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    # 设置超时时间，V8 编译比较慢，防止卡死
+    timeout-minutes: 360 
+
+    steps:
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install depot_tools
+      shell: powershell
+      run: |
+        # 下载并解压 depot_tools
+        Invoke-WebRequest -Uri "https://storage.googleapis.com/chrome-infra/depot_tools.zip" -OutFile "depot_tools.zip"
+        Expand-Archive -Path "depot_tools.zip" -DestinationPath "C:\depot_tools" -Force
+        # 将 depot_tools 添加到环境变量
+        echo "C:\depot_tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        # 设置环境变量让 depot_tools 使用系统安装的 VS，而不是自己下载
+        echo "DEPOT_TOOLS_WIN_TOOLCHAIN=0" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+    - name: Update depot_tools
+      shell: powershell
+      run: |
+        # 第一次运行 gclient 会自动通过网络自我更新并下载 python/git 等内部工具
+        # 设置 path 后需要刷新当前 shell 才能生效，所以这里显式调用
+        $env:Path = "C:\depot_tools;" + $env:Path
+        gclient --version
+
+    - name: Fetch V8 Source Code
+      shell: powershell
+      run: |
+        $env:Path = "C:\depot_tools;" + $env:Path
+        mkdir v8_build
+        cd v8_build
+        # 初始化 gclient 配置
+        gclient config --name=v8 "https://chromium.googlesource.com/v8/v8.git"
+        # 同步指定版本的代码
+        # --no-history 减少下载量
+        echo "Syncing V8 version ${{ inputs.v8_version }}..."
+        gclient sync --revision v8@${{ inputs.v8_version }} --no-history --shallow
+
+    - name: Generate Build Files (GN)
+      shell: powershell
+      working-directory: v8_build/v8
+      run: |
+        $env:Path = "C:\depot_tools;" + $env:Path
+        
+        # 根据输入构建参数
+        $pointer_compression = "${{ inputs.pointer_compression }}" -eq "true" ? "true" : "false"
+        $sandbox = "${{ inputs.sandbox }}" -eq "true" ? "true" : "false"
+        
+        echo "Building with Pointer Compression: $pointer_compression"
+        
+        # 生成参数字符串
+        $args = @"
+        is_debug = false
+        target_cpu = ""x64""
+        is_component_build = false
+        v8_static_library = true
+        v8_enable_pointer_compression = $pointer_compression
+        v8_enable_sandbox = $sandbox
+        v8_enable_i18n_support = true
+        treat_warnings_as_errors = false
+        dcheck_always_on = false
+        "@
+        
+        # 写入 args.gn
+        gn gen out/release --args="$args"
+
+    - name: Compile d8 (Ninja)
+      shell: powershell
+      working-directory: v8_build/v8
+      run: |
+        $env:Path = "C:\depot_tools;" + $env:Path
+        # 开始编译，目标是 d8
+        ninja -C out/release d8
+
+    - name: Rename and Prepare Artifact
+      shell: powershell
+      working-directory: v8_build/v8/out/release
+      run: |
+        # 重命名以便区分
+        $suffix = "${{ inputs.pointer_compression }}" -eq "true" ? "pc_on" : "pc_off"
+        Copy-Item d8.exe -Destination "v8_${{ inputs.v8_version }}_${suffix}.exe"
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: v8-binary-${{ inputs.v8_version }}
+        path: v8_build/v8/out/release/v8_*.exe
